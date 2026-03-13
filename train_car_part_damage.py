@@ -117,6 +117,11 @@ def parse_args() -> argparse.Namespace:
         help="Validation metric used to keep the best checkpoint.",
     )
     parser.add_argument(
+        "--refit-on-full-data",
+        action="store_true",
+        help="After validation-based model selection, retrain from scratch on all available images.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -132,7 +137,7 @@ def parse_args() -> argparse.Namespace:
         "--test-samples",
         type=int,
         default=0,
-        help="If >0, evaluate on only the first N test samples.",
+        help="If >0, use only the first N official test samples when building/evaluating splits.",
     )
     return parser.parse_args()
 
@@ -655,6 +660,7 @@ def main() -> None:
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
     best_metric_value = float("-inf")
+    best_epoch = args.epochs
     history: List[Dict[str, object]] = []
 
     print(
@@ -707,6 +713,7 @@ def main() -> None:
 
             if selected_metric_value > best_metric_value:
                 best_metric_value = selected_metric_value
+                best_epoch = epoch
                 save_checkpoint(
                     model,
                     optimizer,
@@ -737,6 +744,64 @@ def main() -> None:
             )
 
         scheduler.step()
+
+    if args.refit_on_full_data:
+        full_train_split = combine_splits([official_train_split, official_test_split])
+        full_train_dataset = CarPartSegmentationDataset(
+            full_train_split,
+            image_size=args.image_size,
+            train=True,
+            hflip_prob=args.hflip_prob,
+        )
+        full_train_loader = DataLoader(
+            full_train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            **common_loader_kwargs,
+        )
+
+        refit_model = build_model(args.encoder_name, encoder_weights=encoder_weights).to(device)
+        refit_optimizer = AdamW(refit_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        refit_scheduler = CosineAnnealingLR(refit_optimizer, T_max=best_epoch, eta_min=args.min_lr)
+        refit_scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
+        print(f"refitting on all data for {best_epoch} epochs")
+        for epoch in range(1, best_epoch + 1):
+            refit_loss = train_one_epoch(
+                model=refit_model,
+                loader=full_train_loader,
+                optimizer=refit_optimizer,
+                criterion=criterion,
+                device=device,
+                epoch=epoch,
+                print_freq=args.print_freq,
+                use_amp=use_amp,
+                scaler=refit_scaler,
+            )
+            print(f"refit_epoch={epoch:02d} train_loss={refit_loss:.4f}")
+            refit_scheduler.step()
+
+        refit_path = output_dir / "model_refit_full.pt"
+        torch.save(
+            {
+                "model_state_dict": refit_model.state_dict(),
+                "label2id": LABEL2ID,
+                "id2label": ID2LABEL,
+                "class_names": CLASS_NAMES,
+                "model_config": {
+                    "arch": "UPerNet",
+                    "encoder_name": args.encoder_name,
+                    "encoder_weights": encoder_weights,
+                    "classes": NUM_CLASSES,
+                    "image_size": args.image_size,
+                },
+                "refit_epochs": best_epoch,
+                "selection_metric": args.best_metric,
+                "split_summary": split_summary,
+            },
+            refit_path,
+        )
+        print(f"saved refit model: {refit_path}")
 
     final_path = output_dir / "model_final.pt"
     torch.save(
