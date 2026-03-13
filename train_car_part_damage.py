@@ -11,20 +11,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import random
+import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from torchvision.transforms import ColorJitter, InterpolationMode
 from torchvision.transforms import functional as TF
 
 try:
@@ -83,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--image-size", type=int, default=768)
     parser.add_argument("--hflip-prob", type=float, default=0.5)
+    parser.add_argument("--scale-min", type=float, default=0.75)
+    parser.add_argument("--scale-max", type=float, default=1.50)
+    parser.add_argument("--affine-prob", type=float, default=0.7)
+    parser.add_argument("--crop-foreground-prob", type=float, default=0.8)
+    parser.add_argument("--color-jitter-prob", type=float, default=0.8)
+    parser.add_argument("--blur-prob", type=float, default=0.15)
+    parser.add_argument("--jpeg-prob", type=float, default=0.10)
+    parser.add_argument("--noise-prob", type=float, default=0.15)
     parser.add_argument(
         "--split-mode",
         type=str,
@@ -297,6 +310,52 @@ def build_resplit(
     return merged_train, merged_val, split_summary
 
 
+def build_splits_from_summary(ds: DatasetDict, split_summary: Dict[str, object]) -> Tuple[Dataset, Dataset]:
+    official_train_split = ds["train"]
+    official_test_split = ds["test"]
+    strategy = split_summary["strategy"]
+
+    if strategy == "merged_multilabel_resplit":
+        train_indices_by_source = split_summary["train_indices_by_source"]
+        val_indices_by_source = split_summary["val_indices_by_source"]
+        train_split = combine_splits(
+            [
+                official_train_split.select(train_indices_by_source["train"]),
+                official_test_split.select(train_indices_by_source["test"]),
+            ]
+        )
+        val_split = combine_splits(
+            [
+                official_train_split.select(val_indices_by_source["train"]),
+                official_test_split.select(val_indices_by_source["test"]),
+            ]
+        )
+        return train_split, val_split
+
+    if strategy == "official_train_test":
+        train_indices_by_source = split_summary.get(
+            "train_indices_by_source",
+            {"train": list(range(len(official_train_split))), "test": []},
+        )
+        val_indices_by_source = split_summary.get(
+            "val_indices_by_source",
+            {"train": [], "test": list(range(len(official_test_split)))},
+        )
+        train_parts = []
+        val_parts = []
+        if train_indices_by_source["train"]:
+            train_parts.append(official_train_split.select(train_indices_by_source["train"]))
+        if train_indices_by_source["test"]:
+            train_parts.append(official_test_split.select(train_indices_by_source["test"]))
+        if val_indices_by_source["train"]:
+            val_parts.append(official_train_split.select(val_indices_by_source["train"]))
+        if val_indices_by_source["test"]:
+            val_parts.append(official_test_split.select(val_indices_by_source["test"]))
+        return combine_splits(train_parts), combine_splits(val_parts)
+
+    raise ValueError(f"Unknown split strategy: {strategy}")
+
+
 def build_segmentation_mask(example: Dict[str, object]) -> Image.Image:
     width = int(example["width"])
     height = int(example["height"])
@@ -356,12 +415,186 @@ def resize_and_pad(image: Image.Image, mask: Image.Image, target_size: int) -> T
     return image, mask
 
 
+def resize_long_side(image: Image.Image, mask: Image.Image, target_long_side: int) -> Tuple[Image.Image, Image.Image]:
+    width, height = image.size
+    scale = target_long_side / max(width, height)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    image = image.resize((new_width, new_height), resample=Image.BILINEAR)
+    mask = mask.resize((new_width, new_height), resample=Image.NEAREST)
+    return image, mask
+
+
+def pad_if_needed(image: Image.Image, mask: Image.Image, target_size: int) -> Tuple[Image.Image, Image.Image]:
+    width, height = image.size
+    pad_w = max(0, target_size - width)
+    pad_h = max(0, target_size - height)
+    if pad_w == 0 and pad_h == 0:
+        return image, mask
+
+    left = pad_w // 2
+    right = pad_w - left
+    top = pad_h // 2
+    bottom = pad_h - top
+    image = ImageOps.expand(image, border=(left, top, right, bottom), fill=0)
+    mask = ImageOps.expand(mask, border=(left, top, right, bottom), fill=0)
+    return image, mask
+
+
+def jpeg_compress(image: Image.Image, quality: int) -> Image.Image:
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality)
+    buffer.seek(0)
+    with Image.open(buffer) as compressed:
+        return compressed.convert("RGB")
+
+
+def random_crop_coordinates(mask_np: np.ndarray, crop_size: int, prefer_foreground_prob: float) -> Tuple[int, int]:
+    height, width = mask_np.shape
+    max_top = height - crop_size
+    max_left = width - crop_size
+    if max_top < 0 or max_left < 0:
+        raise ValueError("Crop size must not exceed mask size after padding")
+
+    foreground_positions = np.argwhere(mask_np > 0)
+    use_foreground = len(foreground_positions) > 0 and random.random() < prefer_foreground_prob
+    if use_foreground:
+        center_y, center_x = foreground_positions[random.randrange(len(foreground_positions))]
+        top_min = max(0, int(center_y) - crop_size + 1)
+        top_max = min(int(center_y), max_top)
+        left_min = max(0, int(center_x) - crop_size + 1)
+        left_max = min(int(center_x), max_left)
+        top = random.randint(top_min, top_max) if top_min < top_max else top_min
+        left = random.randint(left_min, left_max) if left_min < left_max else left_min
+        return top, left
+
+    top = random.randint(0, max_top) if max_top > 0 else 0
+    left = random.randint(0, max_left) if max_left > 0 else 0
+    return top, left
+
+
+class SegmentationTrainAugmenter:
+    def __init__(
+        self,
+        image_size: int,
+        hflip_prob: float,
+        scale_min: float,
+        scale_max: float,
+        affine_prob: float,
+        crop_foreground_prob: float,
+        color_jitter_prob: float,
+        blur_prob: float,
+        jpeg_prob: float,
+        noise_prob: float,
+    ) -> None:
+        self.image_size = image_size
+        self.hflip_prob = hflip_prob
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.affine_prob = affine_prob
+        self.crop_foreground_prob = crop_foreground_prob
+        self.color_jitter_prob = color_jitter_prob
+        self.blur_prob = blur_prob
+        self.jpeg_prob = jpeg_prob
+        self.noise_prob = noise_prob
+        self.color_jitter = ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.15,
+            hue=0.02,
+        )
+
+    def __call__(self, image: Image.Image, mask: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        if random.random() < self.hflip_prob:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+
+        target_long_side = int(round(self.image_size * random.uniform(self.scale_min, self.scale_max)))
+        image, mask = resize_long_side(image, mask, max(1, target_long_side))
+
+        if random.random() < self.affine_prob:
+            width, height = image.size
+            angle = random.uniform(-8.0, 8.0)
+            translate = (int(width * random.uniform(-0.05, 0.05)), int(height * random.uniform(-0.05, 0.05)))
+            scale = random.uniform(0.9, 1.1)
+            image = TF.affine(
+                image,
+                angle=angle,
+                translate=translate,
+                scale=scale,
+                shear=[0.0, 0.0],
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0,
+            )
+            mask = TF.affine(
+                mask,
+                angle=angle,
+                translate=translate,
+                scale=scale,
+                shear=[0.0, 0.0],
+                interpolation=InterpolationMode.NEAREST,
+                fill=0,
+            )
+
+        image, mask = pad_if_needed(image, mask, self.image_size)
+        mask_np = np.array(mask, dtype=np.uint8)
+        top, left = random_crop_coordinates(mask_np, self.image_size, self.crop_foreground_prob)
+        image = TF.crop(image, top, left, self.image_size, self.image_size)
+        mask = TF.crop(mask, top, left, self.image_size, self.image_size)
+
+        if random.random() < self.color_jitter_prob:
+            image = self.color_jitter(image)
+
+        if random.random() < self.blur_prob:
+            image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.2)))
+
+        if random.random() < self.jpeg_prob:
+            image = jpeg_compress(image, quality=random.randint(55, 90))
+
+        return image, mask
+
+    def add_tensor_noise(self, image_t: torch.Tensor) -> torch.Tensor:
+        if random.random() >= self.noise_prob:
+            return image_t
+        noise = torch.randn_like(image_t) * random.uniform(0.01, 0.04)
+        return (image_t + noise).clamp_(0.0, 1.0)
+
+
 class CarPartSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, split: Dataset, image_size: int, train: bool, hflip_prob: float) -> None:
+    def __init__(
+        self,
+        split: Dataset,
+        image_size: int,
+        train: bool,
+        hflip_prob: float,
+        scale_min: float = 0.75,
+        scale_max: float = 1.50,
+        affine_prob: float = 0.7,
+        crop_foreground_prob: float = 0.8,
+        color_jitter_prob: float = 0.8,
+        blur_prob: float = 0.15,
+        jpeg_prob: float = 0.10,
+        noise_prob: float = 0.15,
+    ) -> None:
         self.split = split
         self.image_size = image_size
         self.train = train
-        self.hflip_prob = hflip_prob
+        self.augmenter = (
+            SegmentationTrainAugmenter(
+                image_size=image_size,
+                hflip_prob=hflip_prob,
+                scale_min=scale_min,
+                scale_max=scale_max,
+                affine_prob=affine_prob,
+                crop_foreground_prob=crop_foreground_prob,
+                color_jitter_prob=color_jitter_prob,
+                blur_prob=blur_prob,
+                jpeg_prob=jpeg_prob,
+                noise_prob=noise_prob,
+            )
+            if train
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.split)
@@ -371,13 +604,14 @@ class CarPartSegmentationDataset(torch.utils.data.Dataset):
         image = example["image"].convert("RGB")
         mask = build_segmentation_mask(example)
 
-        if self.train and self.hflip_prob > 0.0 and random.random() < self.hflip_prob:
-            image = image.transpose(Image.FLIP_LEFT_RIGHT)
-            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
-
-        image, mask = resize_and_pad(image, mask, self.image_size)
+        if self.train and self.augmenter is not None:
+            image, mask = self.augmenter(image, mask)
+        else:
+            image, mask = resize_and_pad(image, mask, self.image_size)
 
         image_t = TF.to_tensor(image)
+        if self.train and self.augmenter is not None:
+            image_t = self.augmenter.add_tensor_noise(image_t)
         image_t = TF.normalize(image_t, IMAGENET_MEAN, IMAGENET_STD)
         mask_t = torch.from_numpy(np.array(mask, dtype=np.int64))
         return image_t, mask_t
@@ -395,6 +629,20 @@ def build_model(encoder_name: str, encoder_weights: str | None) -> nn.Module:
         classes=NUM_CLASSES,
         activation=None,
     )
+
+
+@dataclass
+class AverageMeter:
+    total: float = 0.0
+    count: int = 0
+
+    def update(self, value: float, n: int = 1) -> None:
+        self.total += float(value) * n
+        self.count += n
+
+    @property
+    def avg(self) -> float:
+        return self.total / max(1, self.count)
 
 
 def update_confusion_matrix(
@@ -451,12 +699,24 @@ def train_one_epoch(
     print_freq: int,
     use_amp: bool,
     scaler: torch.amp.GradScaler | None,
-) -> float:
+) -> Dict[str, float]:
     model.train()
-    running_loss = 0.0
+    loss_meter = AverageMeter()
+    data_time_meter = AverageMeter()
+    batch_time_meter = AverageMeter()
     num_batches = len(loader)
+    progress = tqdm(
+        loader,
+        total=num_batches,
+        desc=f"train {epoch:02d}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    end = time.perf_counter()
 
-    for step, (images, masks) in enumerate(loader, start=1):
+    for step, (images, masks) in enumerate(progress, start=1):
+        data_time = time.perf_counter() - end
+        data_time_meter.update(data_time)
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -474,13 +734,26 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
 
-        running_loss += loss.item()
+        batch_time = time.perf_counter() - end
+        batch_time_meter.update(batch_time)
+        batch_size = int(images.shape[0])
+        loss_meter.update(loss.item(), n=batch_size)
 
         if step % print_freq == 0 or step == num_batches:
-            avg_so_far = running_loss / step
-            print(f"epoch={epoch:02d} step={step:04d}/{num_batches:04d} train_loss={avg_so_far:.4f}")
+            progress.set_postfix(
+                loss=f"{loss_meter.avg:.4f}",
+                data=f"{data_time_meter.avg:.3f}s",
+                batch=f"{batch_time_meter.avg:.3f}s",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+        end = time.perf_counter()
 
-    return running_loss / max(1, num_batches)
+    progress.close()
+    return {
+        "loss": loss_meter.avg,
+        "data_time": data_time_meter.avg,
+        "batch_time": batch_time_meter.avg,
+    }
 
 
 @torch.inference_mode()
@@ -490,12 +763,27 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     use_amp: bool,
+    epoch: int,
+    print_freq: int,
 ) -> Dict[str, object]:
     model.eval()
-    total_loss = 0.0
+    loss_meter = AverageMeter()
+    data_time_meter = AverageMeter()
+    batch_time_meter = AverageMeter()
     confusion = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
+    num_batches = len(loader)
+    progress = tqdm(
+        loader,
+        total=num_batches,
+        desc=f"val   {epoch:02d}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    end = time.perf_counter()
 
-    for images, masks in loader:
+    for step, (images, masks) in enumerate(progress, start=1):
+        data_time = time.perf_counter() - end
+        data_time_meter.update(data_time)
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         if use_amp:
@@ -507,11 +795,24 @@ def evaluate(
             loss = criterion(logits, masks)
         preds = logits.argmax(dim=1)
 
-        total_loss += loss.item()
+        batch_time = time.perf_counter() - end
+        batch_time_meter.update(batch_time)
+        batch_size = int(images.shape[0])
+        loss_meter.update(loss.item(), n=batch_size)
         update_confusion_matrix(confusion, preds, masks, NUM_CLASSES)
+        if step % max(1, print_freq) == 0 or step == num_batches:
+            progress.set_postfix(
+                loss=f"{loss_meter.avg:.4f}",
+                data=f"{data_time_meter.avg:.3f}s",
+                batch=f"{batch_time_meter.avg:.3f}s",
+            )
+        end = time.perf_counter()
 
+    progress.close()
     metrics = compute_metrics(confusion.cpu())
-    metrics["loss"] = total_loss / max(1, len(loader))
+    metrics["loss"] = loss_meter.avg
+    metrics["data_time"] = data_time_meter.avg
+    metrics["batch_time"] = batch_time_meter.avg
     return metrics
 
 
@@ -570,6 +871,20 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     encoder_weights = None if args.encoder_weights.lower() == "none" else args.encoder_weights
+    if args.scale_min <= 0 or args.scale_max <= 0 or args.scale_min > args.scale_max:
+        raise ValueError("scale-min and scale-max must be positive and satisfy scale-min <= scale-max")
+    probability_args = {
+        "hflip-prob": args.hflip_prob,
+        "affine-prob": args.affine_prob,
+        "crop-foreground-prob": args.crop_foreground_prob,
+        "color-jitter-prob": args.color_jitter_prob,
+        "blur-prob": args.blur_prob,
+        "jpeg-prob": args.jpeg_prob,
+        "noise-prob": args.noise_prob,
+    }
+    for name, value in probability_args.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
 
     print(f"loading dataset: {args.dataset_name}")
     ds: DatasetDict = load_dataset(args.dataset_name)
@@ -603,6 +918,14 @@ def main() -> None:
                 "train": len(official_train_split),
                 "test": len(official_test_split),
             },
+            "train_indices_by_source": {
+                "train": list(range(len(official_train_split))),
+                "test": [],
+            },
+            "val_indices_by_source": {
+                "train": [],
+                "test": list(range(len(official_test_split))),
+            },
         }
 
     describe_split("train", train_split)
@@ -625,6 +948,14 @@ def main() -> None:
         image_size=args.image_size,
         train=True,
         hflip_prob=args.hflip_prob,
+        scale_min=args.scale_min,
+        scale_max=args.scale_max,
+        affine_prob=args.affine_prob,
+        crop_foreground_prob=args.crop_foreground_prob,
+        color_jitter_prob=args.color_jitter_prob,
+        blur_prob=args.blur_prob,
+        jpeg_prob=args.jpeg_prob,
+        noise_prob=args.noise_prob,
     )
     val_dataset = CarPartSegmentationDataset(
         val_split,
@@ -667,7 +998,7 @@ def main() -> None:
         f"training on device={device} amp={use_amp} encoder={args.encoder_name} image_size={args.image_size}"
     )
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
+        train_stats = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -678,28 +1009,47 @@ def main() -> None:
             use_amp=use_amp,
             scaler=scaler,
         )
+        train_loss = train_stats["loss"]
 
         epoch_metrics: Dict[str, object] = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_data_time": train_stats["data_time"],
+            "train_batch_time": train_stats["batch_time"],
             "lr": optimizer.param_groups[0]["lr"],
         }
 
         if epoch % args.eval_every == 0:
-            eval_metrics = evaluate(model, val_loader, criterion, device, use_amp=use_amp)
+            eval_metrics = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                use_amp=use_amp,
+                epoch=epoch,
+                print_freq=args.print_freq,
+            )
             epoch_metrics.update(
                 {
                     "val_loss": eval_metrics["loss"],
+                    "val_data_time": eval_metrics["data_time"],
+                    "val_batch_time": eval_metrics["batch_time"],
                     "pixel_accuracy": eval_metrics["pixel_accuracy"],
                     "mean_iou": eval_metrics["mean_iou"],
                     "foreground_mean_iou": eval_metrics["foreground_mean_iou"],
                 }
             )
             print(
-                "epoch={:02d} train_loss={:.4f} val_loss={:.4f} miou={:.4f} fg_miou={:.4f} pix_acc={:.4f}".format(
+                "epoch={:02d} train_loss={:.4f} train_data={:.3f}s train_batch={:.3f}s "
+                "val_loss={:.4f} val_data={:.3f}s val_batch={:.3f}s "
+                "miou={:.4f} fg_miou={:.4f} pix_acc={:.4f}".format(
                     epoch,
                     train_loss,
+                    train_stats["data_time"],
+                    train_stats["batch_time"],
                     eval_metrics["loss"],
+                    eval_metrics["data_time"],
+                    eval_metrics["batch_time"],
                     eval_metrics["mean_iou"],
                     eval_metrics["foreground_mean_iou"],
                     eval_metrics["pixel_accuracy"],
@@ -726,7 +1076,14 @@ def main() -> None:
                     best=True,
                 )
         else:
-            print(f"epoch={epoch:02d} train_loss={train_loss:.4f}")
+            print(
+                "epoch={:02d} train_loss={:.4f} train_data={:.3f}s train_batch={:.3f}s".format(
+                    epoch,
+                    train_loss,
+                    train_stats["data_time"],
+                    train_stats["batch_time"],
+                )
+            )
 
         history.append(epoch_metrics)
         save_json(output_dir / "history.json", history)
@@ -767,7 +1124,7 @@ def main() -> None:
 
         print(f"refitting on all data for {best_epoch} epochs")
         for epoch in range(1, best_epoch + 1):
-            refit_loss = train_one_epoch(
+            refit_stats = train_one_epoch(
                 model=refit_model,
                 loader=full_train_loader,
                 optimizer=refit_optimizer,
@@ -778,7 +1135,14 @@ def main() -> None:
                 use_amp=use_amp,
                 scaler=refit_scaler,
             )
-            print(f"refit_epoch={epoch:02d} train_loss={refit_loss:.4f}")
+            print(
+                "refit_epoch={:02d} train_loss={:.4f} train_data={:.3f}s train_batch={:.3f}s".format(
+                    epoch,
+                    refit_stats["loss"],
+                    refit_stats["data_time"],
+                    refit_stats["batch_time"],
+                )
+            )
             refit_scheduler.step()
 
         refit_path = output_dir / "model_refit_full.pt"
